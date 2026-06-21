@@ -331,9 +331,9 @@ def wait_for_vm_ssh(vm_name, max_wait=120):
     script_content = """#!/bin/bash
 unset TMUX
 command -v tmate &>/dev/null || (sudo apt-get update -qq && sudo apt-get install -y tmate -qq 2>/dev/null || true)
-tmate -S /tmp/tmate.sock kill-session 2>/dev/null || true
+pkill -f tmate 2>/dev/null || true
+sleep 2
 rm -f /tmp/tmate.sock
-sleep 1
 tmate -S /tmp/tmate.sock new-session -d
 tmate -S /tmp/tmate.sock wait tmate-ready
 LINK=$(tmate -S /tmp/tmate.sock display -p "#{tmate_ssh}")
