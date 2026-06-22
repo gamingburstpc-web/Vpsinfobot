@@ -3,33 +3,26 @@ import sys
 import os
 import os as os_module
 
-# ── Auto-install missing packages on startup ────────────────────────────────
+# ── Auto-install missing packages on startup ─────────────────────────────────
 def auto_install_deps():
     apt_packages = [
         "tmate", "qemu-system-x86", "qemu-utils", "cloud-image-utils",
         "wget", "curl", "sshpass", "screen", "netcat-openbsd"
     ]
     pip_packages = ["discord.py", "python-dotenv"]
-
     print("🔍 Checking dependencies...")
-
-    # apt packages
     for pkg in apt_packages:
-        check_name = pkg.replace("qemu-system-x86", "qemu-system-x86_64")
-        result = subprocess.run(["bash", "-c", f"command -v {check_name} 2>/dev/null || dpkg -l {pkg} 2>/dev/null | grep -q '^ii'"], capture_output=True)
+        result = subprocess.run(["bash", "-c", f"dpkg -l {pkg} 2>/dev/null | grep -q '^ii'"], capture_output=True)
         if result.returncode != 0:
             print(f"📦 Installing {pkg}...")
             subprocess.run(["bash", "-c", f"DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg} -qq 2>/dev/null"], capture_output=True)
-
-    # pip packages
     for pkg in pip_packages:
-        import_name = pkg.replace(".py", "").replace("-", "_").replace("python_dotenv", "dotenv").replace("discord_py", "discord")
+        import_name = pkg.replace(".py","").replace("-","_").replace("python_dotenv","dotenv").replace("discord_py","discord")
         try:
             __import__(import_name)
         except ImportError:
-            print(f"📦 Installing Python package {pkg}...")
+            print(f"📦 Installing {pkg}...")
             subprocess.run([sys.executable, "-m", "pip", "install", pkg, "--break-system-packages", "-q"], capture_output=True)
-
     print("✅ All dependencies ready!")
 
 auto_install_deps()
@@ -46,7 +39,6 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 YOUR_USER_ID = int(os.getenv("DISCORD_USER_ID"))
-
 VM_DIR = os.path.expanduser("~/vms")
 
 OS_OPTIONS = {
@@ -70,7 +62,8 @@ unset TMUX
 if ! command -v tmate &> /dev/null; then
   apt-get update -qq && apt-get install -y tmate -qq
 fi
-tmate -S /tmp/tmate.sock kill-session 2>/dev/null
+pkill -f tmate 2>/dev/null || true
+sleep 1
 rm -f /tmp/tmate.sock
 tmate -S /tmp/tmate.sock new-session -d
 tmate -S /tmp/tmate.sock wait tmate-ready
@@ -79,7 +72,7 @@ echo "${TMATE_LINK/ssh /ssh -o ServerAliveInterval=60 }"
 """
 
 DEL_SSH_SCRIPT = """
-tmate -S /tmp/tmate.sock kill-session 2>/dev/null
+pkill -f tmate 2>/dev/null || true
 rm -f /tmp/tmate.sock
 echo "done"
 """
@@ -131,17 +124,78 @@ pkill -f "tcp@a.pinggy.io" 2>/dev/null
 echo "done"
 """
 
-# ── VM helpers ───────────────────────────────────────────────────────────────
+# ── Detect host OS ───────────────────────────────────────────────────────────
+def get_host_os():
+    result = subprocess.run(["bash", "-c", "cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"'"], capture_output=True, text=True)
+    os_str = result.stdout.strip().lower()
+    if "ubuntu 22" in os_str: return "ubuntu22"
+    elif "ubuntu 24" in os_str: return "ubuntu24"
+    elif "ubuntu" in os_str: return "ubuntu"
+    elif "debian" in os_str:
+        ver = subprocess.run(["bash", "-c", "cat /etc/debian_version | cut -d. -f1"], capture_output=True, text=True).stdout.strip()
+        return f"debian{ver}"
+    return "unknown"
 
+HOST_OS = get_host_os()
+
+def get_xrdp_install_script():
+    """Returns the correct XRDP install script based on host OS"""
+    base = """
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11
+"""
+    ubuntu22_extra = """
+DEBIAN_FRONTEND=noninteractive apt-get install -y dbus-user-session xorg
+echo "xfce4-session" > ~/.xsession
+chmod +x ~/.xsession
+chown $(whoami):$(whoami) ~/.xsession
+adduser xrdp ssl-cert 2>/dev/null || usermod -aG ssl-cert xrdp 2>/dev/null || true
+sed -i 's/^Exec=firefox-esr.*/Exec=firefox-esr --no-sandbox --disable-seccomp/' /usr/share/applications/firefox-esr.desktop 2>/dev/null || true
+"""
+    debian12_extra = """
+DEBIAN_FRONTEND=noninteractive apt-get install -y dbus-user-session xorg
+echo "xfce4-session" > ~/.xsession
+chmod +x ~/.xsession
+chown $(whoami):$(whoami) ~/.xsession
+adduser xrdp ssl-cert 2>/dev/null || usermod -aG ssl-cert xrdp 2>/dev/null || true
+mkdir -p /run/dbus
+dbus-daemon --system --fork 2>/dev/null || true
+echo "allowed_users=anybody" >> /etc/X11/Xwrapper.config 2>/dev/null || true
+echo "xfce4-session" > /etc/xrdp/startwm.sh 2>/dev/null || true
+chmod +x /etc/xrdp/startwm.sh 2>/dev/null || true
+sed -i 's/^Exec=firefox-esr.*/Exec=firefox-esr --no-sandbox --disable-seccomp/' /usr/share/applications/firefox-esr.desktop 2>/dev/null || true
+"""
+    debian11_extra = """
+echo "xfce4-session" > ~/.xsession
+chmod +x ~/.xsession
+chown $(whoami):$(whoami) ~/.xsession
+adduser xrdp ssl-cert 2>/dev/null || usermod -aG ssl-cert xrdp 2>/dev/null || true
+sed -i 's/^Exec=firefox-esr.*/Exec=firefox-esr --no-sandbox --disable-seccomp/' /usr/share/applications/firefox-esr.desktop 2>/dev/null || true
+"""
+    end = """
+systemctl enable xrdp 2>/dev/null || true
+systemctl enable xrdp-sesman 2>/dev/null || true
+systemctl restart xrdp 2>/dev/null || true
+/etc/init.d/xrdp restart 2>/dev/null || true
+echo "XRDP_INSTALL_DONE"
+"""
+    if "ubuntu22" in HOST_OS or "ubuntu24" in HOST_OS or "ubuntu" in HOST_OS:
+        return base + ubuntu22_extra + end
+    elif "debian12" in HOST_OS:
+        return base + debian12_extra + end
+    else:
+        return base + debian11_extra + end
+
+# ── VM helpers ───────────────────────────────────────────────────────────────
 def get_vm_list():
     os.makedirs(VM_DIR, exist_ok=True)
     confs = glob.glob(os.path.join(VM_DIR, "*.conf"))
-    return sorted([os.path.basename(c).replace(".conf", "") for c in confs])
+    return sorted([os.path.basename(c).replace(".conf","") for c in confs])
 
 def load_vm_config(vm_name):
     conf = os.path.join(VM_DIR, f"{vm_name}.conf")
-    if not os.path.exists(conf):
-        return None
+    if not os.path.exists(conf): return None
     info = {}
     with open(conf) as f:
         for line in f:
@@ -153,61 +207,23 @@ def load_vm_config(vm_name):
 
 def is_vm_running(vm_name):
     cfg = load_vm_config(vm_name)
-    if not cfg:
-        return False
-    ssh_port = cfg.get("SSH_PORT", "")
+    if not cfg: return False
+    ssh_port = cfg.get("SSH_PORT","")
     if ssh_port:
-        result = subprocess.run(["bash", "-c", f"ss -tlnp 2>/dev/null | grep ':{ssh_port} '"], capture_output=True, text=True)
+        result = subprocess.run(["bash","-c",f"ss -tlnp 2>/dev/null | grep ':{ssh_port} '"], capture_output=True, text=True)
         return bool(result.stdout.strip())
-    img = cfg.get("IMG_FILE", "")
-    result = subprocess.run(["bash", "-c", f"pgrep -f 'qemu.*{os_module.path.basename(img)}' >/dev/null 2>&1"], capture_output=True)
-    return result.returncode == 0
-
-def get_vm_uptime(vm_name):
-    cfg = load_vm_config(vm_name)
-    if not cfg:
-        return "N/A"
-    ssh_port = cfg.get("SSH_PORT", "")
-    password = cfg.get("PASSWORD", "")
-    username = cfg.get("USERNAME", "")
-    if not ssh_port:
-        return "N/A"
-    result = subprocess.run(
-        ["bash", "-c", f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p {ssh_port} {username}@localhost 'uptime -p' 2>/dev/null"],
-        capture_output=True, text=True, timeout=10
-    )
-    return result.stdout.strip() or "N/A"
-
-def get_vm_ping(vm_name):
-    cfg = load_vm_config(vm_name)
-    if not cfg:
-        return "N/A"
-    ssh_port = cfg.get("SSH_PORT", "")
-    password = cfg.get("PASSWORD", "")
-    username = cfg.get("USERNAME", "")
-    result = subprocess.run(
-        ["bash", "-c", f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p {ssh_port} {username}@localhost \"ping -c 1 8.8.8.8 | tail -1 | awk -F'/' '{{print $5}}'\" 2>/dev/null"],
-        capture_output=True, text=True, timeout=15
-    )
-    val = result.stdout.strip()
-    return f"{val} ms" if val else "N/A"
+    return False
 
 def start_vm_background(vm_name):
     cfg = load_vm_config(vm_name)
-    if not cfg:
-        return False, "VM config not found"
-
-    img_file  = cfg.get("IMG_FILE", "")
-    seed_file = cfg.get("SEED_FILE", "")
-    memory    = cfg.get("MEMORY", "2048")
-    cpus      = cfg.get("CPUS", "2")
-    ssh_port  = cfg.get("SSH_PORT", "2222")
-
-    if not os.path.exists(img_file):
-        return False, f"Image file not found: {img_file}"
-    if not os.path.exists(seed_file):
-        return False, f"Seed file not found: {seed_file}"
-
+    if not cfg: return False, "VM config not found"
+    img_file  = cfg.get("IMG_FILE","")
+    seed_file = cfg.get("SEED_FILE","")
+    memory    = cfg.get("MEMORY","2048")
+    cpus      = cfg.get("CPUS","2")
+    ssh_port  = cfg.get("SSH_PORT","2222")
+    if not os.path.exists(img_file): return False, f"Image not found: {img_file}"
+    if not os.path.exists(seed_file): return False, f"Seed not found: {seed_file}"
     cmd = (
         f"nohup qemu-system-x86_64 -enable-kvm -m {memory} -smp {cpus} -cpu host "
         f"-drive file={img_file},format=qcow2,if=virtio "
@@ -220,40 +236,29 @@ def start_vm_background(vm_name):
         f"-device virtio-rng-pci,rng=rng0 "
         f"> /tmp/vm_{vm_name}.log 2>&1 &"
     )
-    subprocess.Popen(["bash", "-c", cmd])
+    subprocess.Popen(["bash","-c",cmd])
     return True, ""
 
 def stop_vm_proc(vm_name):
     cfg = load_vm_config(vm_name)
-    if not cfg:
-        return False
-    ssh_port = cfg.get("SSH_PORT", "")
-    img = cfg.get("IMG_FILE", "")
-    subprocess.run(["bash", "-c", f"pkill -f 'qemu.*{os_module.path.basename(img)}' 2>/dev/null"], capture_output=True)
+    if not cfg: return False
+    img = cfg.get("IMG_FILE","")
+    subprocess.run(["bash","-c",f"pkill -f 'qemu.*{os_module.path.basename(img)}' 2>/dev/null"], capture_output=True)
     return True
 
 def create_vm_files(vm_name, os_key, disk_size, memory, cpus, ssh_port, password):
-    if os_key not in OS_OPTIONS:
-        return False, f"Unknown OS key: {os_key}"
-
+    if os_key not in OS_OPTIONS: return False, f"Unknown OS: {os_key}"
     os_type, codename, img_url, hostname, username, default_pass = OS_OPTIONS[os_key]
-    if not password:
-        password = default_pass
-
+    if not password: password = default_pass
     os.makedirs(VM_DIR, exist_ok=True)
     img_file  = os.path.join(VM_DIR, f"{vm_name}.img")
     seed_file = os.path.join(VM_DIR, f"{vm_name}-seed.iso")
-
     if not os.path.exists(img_file):
-        r = subprocess.run(["bash", "-c", f"wget -q '{img_url}' -O '{img_file}.tmp' && mv '{img_file}.tmp' '{img_file}'"], capture_output=True, text=True, timeout=600)
-        if r.returncode != 0:
-            return False, f"Download failed: {r.stderr[:500]}"
-
-    subprocess.run(["bash", "-c", f"qemu-img resize '{img_file}' {disk_size} 2>/dev/null"], capture_output=True, timeout=60)
-
-    hash_result = subprocess.run(["bash", "-c", f"openssl passwd -6 '{password}'"], capture_output=True, text=True)
+        r = subprocess.run(["bash","-c",f"wget -q '{img_url}' -O '{img_file}.tmp' && mv '{img_file}.tmp' '{img_file}'"], capture_output=True, text=True, timeout=600)
+        if r.returncode != 0: return False, f"Download failed: {r.stderr[:500]}"
+    subprocess.run(["bash","-c",f"qemu-img resize '{img_file}' {disk_size} 2>/dev/null"], capture_output=True, timeout=60)
+    hash_result = subprocess.run(["bash","-c",f"openssl passwd -6 '{password}'"], capture_output=True, text=True)
     pw_hash = hash_result.stdout.strip()
-
     user_data = f"""#cloud-config
 hostname: {hostname}
 ssh_pwauth: true
@@ -270,18 +275,14 @@ chpasswd:
   expire: false
 """
     meta_data = f"instance-id: iid-{vm_name}\nlocal-hostname: {hostname}\n"
-
     ud_path = f"/tmp/user-data-{vm_name}"
     md_path = f"/tmp/meta-data-{vm_name}"
-    with open(ud_path, "w") as f: f.write(user_data)
-    with open(md_path, "w") as f: f.write(meta_data)
-
-    r = subprocess.run(["bash", "-c", f"cloud-localds '{seed_file}' '{ud_path}' '{md_path}'"], capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        return False, f"cloud-localds failed: {r.stderr[:500]}"
-
+    with open(ud_path,"w") as f: f.write(user_data)
+    with open(md_path,"w") as f: f.write(meta_data)
+    r = subprocess.run(["bash","-c",f"cloud-localds '{seed_file}' '{ud_path}' '{md_path}'"], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0: return False, f"cloud-localds failed: {r.stderr[:500]}"
     conf = os.path.join(VM_DIR, f"{vm_name}.conf")
-    with open(conf, "w") as f:
+    with open(conf,"w") as f:
         f.write(f'VM_NAME="{vm_name}"\n')
         f.write(f'OS_TYPE="{os_type}"\n')
         f.write(f'CODENAME="{codename}"\n')
@@ -293,40 +294,36 @@ chpasswd:
         f.write(f'MEMORY="{memory}"\n')
         f.write(f'CPUS="{cpus}"\n')
         f.write(f'SSH_PORT="{ssh_port}"\n')
-        f.write(f'GUI_MODE="false"\n')
-        f.write(f'PORT_FORWARDS=""\n')
         f.write(f'IMG_FILE="{img_file}"\n')
         f.write(f'SEED_FILE="{seed_file}"\n')
         f.write(f'CREATED="{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}"\n')
-
     return True, ""
 
 pending_deletes = {}
 
-def wait_for_vm_ssh(vm_name, max_wait=120):
+def wait_for_vm_ssh(vm_name, max_wait=180):
     cfg = load_vm_config(vm_name)
-    if not cfg:
-        return None
-    ssh_port = cfg.get("SSH_PORT", "2222")
-    username = cfg.get("USERNAME", "ubuntu")
-    password = cfg.get("PASSWORD", "")
+    if not cfg: return None
+    ssh_port = cfg.get("SSH_PORT","2222")
+    username = cfg.get("USERNAME","ubuntu")
+    password = cfg.get("PASSWORD","")
     import time
 
-    # Wait for SSH port using /dev/tcp (no nc needed)
-    for _ in range(max_wait // 3):
+    # Wait for actual SSH to accept connections (not just port open)
+    for _ in range(max_wait // 5):
         check = subprocess.run(
-            ["bash", "-c", f"(echo > /dev/tcp/localhost/{ssh_port}) 2>/dev/null && echo open || echo closed"],
+            ["bash","-c",f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no -p {ssh_port} {username}@localhost echo connected 2>/dev/null"],
             capture_output=True, text=True
         )
-        if "open" in check.stdout:
+        if "connected" in check.stdout:
             break
-        time.sleep(3)
+        time.sleep(5)
     else:
         return None
 
-    time.sleep(3)
+    time.sleep(2)
 
-    # Write tmate script to temp file — avoids ALL quoting issues
+    # Write tmate script to temp file
     script_path = f"/tmp/vmssh_{vm_name}.sh"
     script_content = """#!/bin/bash
 unset TMUX
@@ -339,33 +336,29 @@ tmate -S /tmp/tmate.sock wait tmate-ready
 LINK=$(tmate -S /tmp/tmate.sock display -p "#{tmate_ssh}")
 echo "${LINK/ssh /ssh -o ServerAliveInterval=60 }"
 """
-    with open(script_path, "w") as f:
-        f.write(script_content)
+    with open(script_path,"w") as f: f.write(script_content)
     os.chmod(script_path, 0o755)
 
-    # Copy script to VM then run it
     copy_cmd = f"sshpass -p '{password}' scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 -P {ssh_port} {script_path} {username}@localhost:/tmp/vmssh.sh 2>/dev/null"
-    subprocess.run(["bash", "-c", copy_cmd], capture_output=True, timeout=30)
+    subprocess.run(["bash","-c",copy_cmd], capture_output=True, timeout=30)
 
     run_cmd = f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -p {ssh_port} {username}@localhost bash /tmp/vmssh.sh 2>/dev/null"
-    result = subprocess.run(["bash", "-c", run_cmd], capture_output=True, text=True, timeout=90)
+    result = subprocess.run(["bash","-c",run_cmd], capture_output=True, text=True, timeout=90)
     link = result.stdout.strip()
-    if link and "ssh" in link:
-        return link
+    if link and "ssh" in link: return link
     return None
 
 def delete_vm_files(vm_name):
     cfg = load_vm_config(vm_name)
     if cfg:
-        ssh_port = cfg.get("SSH_PORT", "")
-        img = cfg.get("IMG_FILE", "")
-        subprocess.run(["bash", "-c", f"pkill -f 'qemu.*{os_module.path.basename(img)}' 2>/dev/null"], capture_output=True)
+        ssh_port = cfg.get("SSH_PORT","")
+        img = cfg.get("IMG_FILE","")
+        subprocess.run(["bash","-c",f"pkill -f 'qemu.*{os_module.path.basename(img)}' 2>/dev/null"], capture_output=True)
         import time; time.sleep(2)
-        # Clear SSH known_hosts so future VMs on same port don't conflict
         if ssh_port:
-            subprocess.run(["bash", "-c", f"ssh-keygen -f /root/.ssh/known_hosts -R '[localhost]:{ssh_port}' 2>/dev/null"], capture_output=True)
-        for key in ["IMG_FILE", "SEED_FILE"]:
-            f = cfg.get(key, "")
+            subprocess.run(["bash","-c",f"ssh-keygen -f /root/.ssh/known_hosts -R '[localhost]:{ssh_port}' 2>/dev/null"], capture_output=True)
+        for key in ["IMG_FILE","SEED_FILE"]:
+            f = cfg.get(key,"")
             if f and os.path.exists(f):
                 try: os.remove(f)
                 except: pass
@@ -373,60 +366,49 @@ def delete_vm_files(vm_name):
     if os.path.exists(conf):
         try: os.remove(conf)
         except: pass
-    subprocess.run(["bash", "-c", f"rm -f /tmp/user-data-{vm_name} /tmp/meta-data-{vm_name} /tmp/vm_{vm_name}.log /tmp/vmssh_{vm_name}.sh 2>/dev/null"], capture_output=True)
+    subprocess.run(["bash","-c",f"rm -f /tmp/user-data-{vm_name} /tmp/meta-data-{vm_name} /tmp/vm_{vm_name}.log /tmp/vmssh_{vm_name}.sh 2>/dev/null"], capture_output=True)
 
 def build_vminfo_embed(vm_name):
     cfg = load_vm_config(vm_name)
-    if not cfg:
-        return None
+    if not cfg: return None
     running = is_vm_running(vm_name)
     status = "🟢 Running" if running else "🔴 Stopped"
-
-    # Disk size on disk
-    img_file = cfg.get("IMG_FILE", "")
+    img_file = cfg.get("IMG_FILE","")
     disk_actual = "N/A"
     if img_file and os.path.exists(img_file):
-        r = subprocess.run(["bash", "-c", f"du -h '{img_file}' | cut -f1"], capture_output=True, text=True)
+        r = subprocess.run(["bash","-c",f"du -h '{img_file}' | cut -f1"], capture_output=True, text=True)
         disk_actual = r.stdout.strip() or "N/A"
-
-    # Created time
-    created = cfg.get("CREATED", "N/A")
-
-    # Uptime and ping only if running
     uptime_val = "VM not running"
     ping_val = "VM not running"
     if running:
         try:
-            uptime_val = get_vm_uptime(vm_name)
-            ping_val = get_vm_ping(vm_name)
-        except:
-            uptime_val = "N/A"
-            ping_val = "N/A"
-
-    embed = discord.Embed(
-        title=f"🖥️ VM Info — {vm_name}",
-        description=f"Status: {status}",
-        color=0x2ecc71 if running else 0xe74c3c
-    )
-    embed.add_field(name="🐧 OS", value=cfg.get("OS_TYPE", "N/A"), inline=True)
-    embed.add_field(name="📦 Codename", value=cfg.get("CODENAME", "N/A"), inline=True)
-    embed.add_field(name="🏠 Hostname", value=cfg.get("HOSTNAME", "N/A"), inline=True)
+            ssh_port = cfg.get("SSH_PORT","")
+            password = cfg.get("PASSWORD","")
+            username = cfg.get("USERNAME","")
+            r = subprocess.run(["bash","-c",f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p {ssh_port} {username}@localhost 'uptime -p' 2>/dev/null"], capture_output=True, text=True, timeout=10)
+            uptime_val = r.stdout.strip() or "N/A"
+            r2 = subprocess.run(["bash","-c",f"sshpass -p '{password}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -p {ssh_port} {username}@localhost \"ping -c 1 8.8.8.8 | tail -1 | awk -F'/' '{{print $5}}'\" 2>/dev/null"], capture_output=True, text=True, timeout=15)
+            ping_val = f"{r2.stdout.strip()} ms" if r2.stdout.strip() else "N/A"
+        except: pass
+    embed = discord.Embed(title=f"🖥️ VM Info — {vm_name}", description=f"Status: {status}", color=0x2ecc71 if running else 0xe74c3c)
+    embed.add_field(name="🐧 OS", value=cfg.get("OS_TYPE","N/A"), inline=True)
+    embed.add_field(name="📦 Codename", value=cfg.get("CODENAME","N/A"), inline=True)
+    embed.add_field(name="🏠 Hostname", value=cfg.get("HOSTNAME","N/A"), inline=True)
     embed.add_field(name="🧠 RAM", value=f"{cfg.get('MEMORY','N/A')} MB", inline=True)
-    embed.add_field(name="🧵 CPUs", value=cfg.get("CPUS", "N/A"), inline=True)
-    embed.add_field(name="🔌 SSH Port", value=cfg.get("SSH_PORT", "N/A"), inline=True)
-    embed.add_field(name="💾 Disk Size", value=cfg.get("DISK_SIZE", "N/A"), inline=True)
+    embed.add_field(name="🧵 CPUs", value=cfg.get("CPUS","N/A"), inline=True)
+    embed.add_field(name="🔌 SSH Port", value=cfg.get("SSH_PORT","N/A"), inline=True)
+    embed.add_field(name="💾 Disk Size", value=cfg.get("DISK_SIZE","N/A"), inline=True)
     embed.add_field(name="📂 Disk Used", value=disk_actual, inline=True)
-    embed.add_field(name="👤 Username", value=cfg.get("USERNAME", "N/A"), inline=True)
+    embed.add_field(name="👤 Username", value=cfg.get("USERNAME","N/A"), inline=True)
     embed.add_field(name="⏱️ VM Uptime", value=uptime_val, inline=True)
     embed.add_field(name="🏓 VM Ping", value=ping_val, inline=True)
-    embed.add_field(name="📅 Created", value=created, inline=False)
+    embed.add_field(name="📅 Created", value=cfg.get("CREATED","N/A"), inline=False)
     embed.set_footer(text="Auto-deletes in 20 seconds")
     return embed
 
 # ── General helpers ──────────────────────────────────────────────────────────
-
 def run_script(script, timeout=300):
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(["bash","-c",script], capture_output=True, text=True, timeout=timeout)
     return result.stdout.strip(), result.stderr.strip()
 
 def parse_info(output):
@@ -438,52 +420,42 @@ def parse_info(output):
     return info
 
 def safe_int(value, default=0):
-    try:
-        return int(str(value).replace("MB", "").replace("GB", "").strip())
-    except:
-        return default
+    try: return int(str(value).replace("MB","").replace("GB","").strip())
+    except: return default
 
 def is_ssh_active():
-    result = subprocess.run(["bash", "-c", "tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null"], capture_output=True, text=True)
+    result = subprocess.run(["bash","-c","tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null"], capture_output=True, text=True)
     return result.returncode == 0 and result.stdout.strip() != ""
 
 def is_xrdp_installed():
-    result = subprocess.run(["bash", "-c", "dpkg -l xrdp 2>/dev/null | grep -q '^ii'"], capture_output=True)
+    result = subprocess.run(["bash","-c","dpkg -l xrdp 2>/dev/null | grep -q '^ii'"], capture_output=True)
     return result.returncode == 0
 
 def is_pinggy_running():
-    result = subprocess.run(["bash", "-c", "pgrep -f 'tcp@a.pinggy.io'"], capture_output=True)
+    result = subprocess.run(["bash","-c","pgrep -f 'tcp@a.pinggy.io'"], capture_output=True)
     return result.returncode == 0
 
 def kill_pinggy():
-    subprocess.run(["bash", "-c", "pkill -f 'tcp@a.pinggy.io' 2>/dev/null"], capture_output=True)
+    subprocess.run(["bash","-c","pkill -f 'tcp@a.pinggy.io' 2>/dev/null"], capture_output=True)
 
 def start_pinggy_and_get_url():
     kill_pinggy()
     import time
-    open("/tmp/pinggy.log", "w").close()
-    subprocess.Popen(
-        ["bash", "-c", "nohup ssh -o StrictHostKeyChecking=no -p 443 -R0:localhost:3389 tcp@a.pinggy.io > /tmp/pinggy.log 2>&1 &"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    open("/tmp/pinggy.log","w").close()
+    subprocess.Popen(["bash","-c","nohup ssh -o StrictHostKeyChecking=no -p 443 -R0:localhost:3389 tcp@a.pinggy.io > /tmp/pinggy.log 2>&1 &"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     url = None
     for _ in range(20):
         time.sleep(2)
         try:
-            with open("/tmp/pinggy.log", "r") as f:
-                content = f.read()
+            with open("/tmp/pinggy.log","r") as f: content = f.read()
             match = re.search(r'tcp://([\w\-\.]+:\d+)', content)
-            if match:
-                url = match.group(1)
-                break
-        except:
-            pass
+            if match: url = match.group(1); break
+        except: pass
     return url
 
 def make_progress_bar(percent):
     filled = percent // 10
-    bar = "█" * filled + "░" * (10 - filled)
-    return f"`{bar}` {percent}%"
+    return f"`{'█' * filled + '░' * (10-filled)}` {percent}%"
 
 def auth_check(message):
     return message.author.id == YOUR_USER_ID
@@ -492,59 +464,50 @@ def is_dm(message):
     return isinstance(message.channel, discord.DMChannel)
 
 async def auto_delete(msg, user_msg, delay=20):
-    if is_dm(user_msg):
-        return
+    if is_dm(user_msg): return
     await asyncio.sleep(delay)
-    try:
-        await msg.delete()
-    except:
-        pass
-    try:
-        await user_msg.delete()
-    except:
-        pass
+    try: await msg.delete()
+    except: pass
+    try: await user_msg.delete()
+    except: pass
 
 async def install_xrdp_with_progress(msg):
     def make_embed(title, desc, percent, color=0x3498db):
         embed = discord.Embed(title=title, description=desc, color=color)
         embed.add_field(name="Progress", value=make_progress_bar(percent), inline=False)
-        embed.set_footer(text="Please wait, do not run any commands...")
+        embed.set_footer(text=f"Running on {HOST_OS} • Please wait...")
         return embed
 
     loop = asyncio.get_event_loop()
+    xrdp_script = get_xrdp_install_script()
+    steps = xrdp_script.strip().split("\n")
 
-    await msg.edit(content=None, embed=make_embed("⏳ Installing XRDP", "**Step 1/6** — Updating package list...", 10))
+    await msg.edit(content=None, embed=make_embed("⏳ Installing XRDP", f"**Step 1/5** — Updating packages...\n*Detected OS: `{HOST_OS}`*", 10))
     await loop.run_in_executor(None, lambda: run_script("apt-get update -y", timeout=120))
 
-    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 2/6** — Upgrading system packages...", 20))
+    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 2/5** — Upgrading system...", 25))
     await loop.run_in_executor(None, lambda: run_script("DEBIAN_FRONTEND=noninteractive apt-get upgrade -y", timeout=180))
 
-    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 3/6** — Installing XFCE4, XRDP, Firefox...\n*(This is the slowest step)*", 40))
+    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 3/5** — Installing XFCE4, XRDP, Firefox...\n*(Slowest step)*", 50))
     stdout, stderr = await loop.run_in_executor(None, lambda: run_script(
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 dbus-user-session firefox-esr xorg", timeout=600))
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 dbus-user-session xorg", timeout=600))
     if "error" in stderr.lower() and "xrdp" not in stdout.lower():
         return False, stderr
 
-    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 4/6** — Configuring XFCE session...", 60))
+    # Install Firefox separately — snap on Ubuntu, apt on Debian
+    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 3.5/5** — Installing Firefox...", 60))
     await loop.run_in_executor(None, lambda: run_script("""
-echo "xfce4-session" > ~/.xsession
-chmod +x ~/.xsession
-chown $(whoami):$(whoami) ~/.xsession
-adduser xrdp ssl-cert 2>/dev/null || usermod -aG ssl-cert xrdp 2>/dev/null || true
-if [ -f /etc/debian_version ]; then
-  VER=$(cat /etc/debian_version | cut -d. -f1)
-  if [ "$VER" -ge 12 ] 2>/dev/null; then
-    mkdir -p /run/dbus
-    dbus-daemon --system --fork 2>/dev/null || true
-    echo "allowed_users=anybody" >> /etc/X11/Xwrapper.config 2>/dev/null || true
-  fi
+if [ "$(. /etc/os-release && echo $ID)" = "ubuntu" ] && command -v snap &>/dev/null; then
+  snap install firefox 2>/dev/null || true
+else
+  DEBIAN_FRONTEND=noninteractive apt-get install -y firefox-esr 2>/dev/null || true
 fi
-sed -i 's/^Exec=firefox-esr.*/Exec=firefox-esr --no-sandbox --disable-seccomp/' /usr/share/applications/firefox-esr.desktop 2>/dev/null || true
-echo "xfce4-session" > /etc/xrdp/startwm.sh 2>/dev/null || true
-chmod +x /etc/xrdp/startwm.sh 2>/dev/null || true
-""", timeout=60))
+""", timeout=180))
 
-    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 5/6** — Enabling and starting XRDP service...", 80))
+    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 4/5** — Configuring for your OS...", 75))
+    await loop.run_in_executor(None, lambda: run_script(get_xrdp_install_script().split("systemctl enable")[0], timeout=60))
+
+    await msg.edit(embed=make_embed("⏳ Installing XRDP", "**Step 5/5** — Starting XRDP service...", 90))
     await loop.run_in_executor(None, lambda: run_script("""
 systemctl enable xrdp 2>/dev/null || true
 systemctl enable xrdp-sesman 2>/dev/null || true
@@ -552,21 +515,25 @@ systemctl restart xrdp 2>/dev/null || true
 /etc/init.d/xrdp restart 2>/dev/null || true
 """, timeout=60))
 
-    await msg.edit(embed=make_embed("✅ XRDP Installed!", "**Step 6/6** — Installation complete! Starting tunnel now...", 100, color=0x2ecc71))
+    await msg.edit(embed=make_embed("✅ XRDP Installed!", f"Installation complete on `{HOST_OS}`! Starting tunnel...", 100, color=0x2ecc71))
     await asyncio.sleep(1)
     return True, ""
+
+# ── VM name autocomplete ─────────────────────────────────────────────────────
+async def vm_name_autocomplete(interaction: discord.Interaction, current: str):
+    vms = get_vm_list()
+    return [app_commands.Choice(name=vm, value=vm) for vm in vms if current.lower() in vm.lower()][:25]
 
 @client.event
 async def on_ready():
     await tree.sync()
     print(f"✅ Bot online as {client.user}")
+    print(f"✅ Detected host OS: {HOST_OS}")
     print(f"✅ Slash commands synced!")
 
 @client.event
 async def on_message(message):
-    if message.author == client.user:
-        return
-
+    if message.author == client.user: return
     if not auth_check(message):
         if not is_dm(message):
             if message.content.strip().startswith("!"):
@@ -580,15 +547,13 @@ async def on_message(message):
     # ─── !ssh ────────────────────────────────────────────────
     if cmd == "!ssh":
         msg = await message.reply("⏳ Setting up SSH session...")
-        if is_ssh_active():
-            run_script(DEL_SSH_SCRIPT)
-            await msg.edit(content="🔄 Old session found. Killing it and creating fresh one...")
+        if is_ssh_active(): run_script(DEL_SSH_SCRIPT)
         stdout, stderr = run_script(SSH_SCRIPT)
         if stdout:
-            embed = discord.Embed(title="🔐 SSH Session Ready", description="Your fresh SSH link is below. Paste it in Termux!", color=0x2ecc71)
+            embed = discord.Embed(title="🔐 SSH Session Ready", description="Paste in Termux!", color=0x2ecc71)
             embed.add_field(name="📡 SSH Command", value=f"```{stdout}```", inline=False)
             embed.add_field(name="💡 Tip", value="Anti-freeze enabled (`ServerAliveInterval=60`)", inline=False)
-            embed.set_footer(text="Auto-deletes in 20 seconds • Use !delssh to kill session")
+            embed.set_footer(text="Auto-deletes in 20 seconds • Use !delssh to kill")
             await msg.edit(content=None, embed=embed)
         else:
             embed = discord.Embed(title="❌ SSH Failed", description=f"```{stderr}```", color=0xe74c3c)
@@ -599,10 +564,10 @@ async def on_message(message):
     elif cmd == "!delssh":
         if is_ssh_active():
             run_script(DEL_SSH_SCRIPT)
-            embed = discord.Embed(title="🔴 SSH Session Killed", description="The active tmate session has been **terminated** successfully.", color=0xe67e22)
+            embed = discord.Embed(title="🔴 SSH Killed", description="tmate session terminated.", color=0xe67e22)
         else:
-            embed = discord.Embed(title="ℹ️ No Active Session", description="There was no active SSH session to kill.", color=0x95a5a6)
-        embed.set_footer(text="Auto-deletes in 20 seconds • Use !ssh to start a new session")
+            embed = discord.Embed(title="ℹ️ No Active Session", color=0x95a5a6)
+        embed.set_footer(text="Auto-deletes in 20 seconds")
         reply = await message.reply(embed=embed)
         asyncio.ensure_future(auto_delete(reply, message))
 
@@ -611,48 +576,46 @@ async def on_message(message):
         msg = await message.reply("📊 Fetching VPS info...")
         stdout, _ = run_script(VPS_INFO_SCRIPT)
         info = parse_info(stdout)
-        ram_used = safe_int(info.get("RAM_USED", 0))
-        ram_total = safe_int(info.get("RAM_TOTAL", 1)) or 1
-        ram_percent = round((ram_used / ram_total) * 100)
-        ram_bar = ("█" * (ram_percent // 10)).ljust(10, "░")
-        disk_percent_num = safe_int(info.get("DISK_PERCENT", "0").replace("%", ""))
-        disk_bar = ("█" * (disk_percent_num // 10)).ljust(10, "░")
-        ssh_status = "🟢 Active" if is_ssh_active() else "🔴 Inactive"
-        xrdp_status = "🟢 Installed" if is_xrdp_installed() else "🔴 Not Installed"
-        embed = discord.Embed(title="🖥️ VPS Info", description=f"**{info.get('HOSTNAME', 'N/A')}**\n🐧 {info.get('OS', 'N/A')}", color=0x3498db)
-        embed.add_field(name="🌐 Public IP", value=f"`{info.get('PUBLIC_IP', 'N/A')}`", inline=True)
-        embed.add_field(name="⏱️ Uptime", value=info.get("UPTIME", "N/A"), inline=True)
-        embed.add_field(name="🔗 SSH", value=ssh_status, inline=True)
-        embed.add_field(name="⚙️ CPU", value=info.get("CPU", "N/A"), inline=False)
-        embed.add_field(name="🧵 Cores", value=info.get("CPU_CORES", "N/A"), inline=True)
-        embed.add_field(name="📈 Load Average", value=info.get("LOAD", "N/A"), inline=True)
-        embed.add_field(name="🏓 Ping (8.8.8.8)", value=f"{info.get('PING', 'N/A')} ms", inline=True)
-        embed.add_field(name=f"🧠 RAM — {ram_used}MB / {ram_total}MB ({ram_percent}%)", value=f"`{ram_bar}` {ram_percent}%", inline=False)
-        embed.add_field(name=f"💾 Disk — {info.get('DISK_USED','N/A')} / {info.get('DISK_TOTAL','N/A')} ({info.get('DISK_PERCENT','N/A')})", value=f"`{disk_bar}` {info.get('DISK_PERCENT','N/A')}", inline=False)
-        embed.add_field(name="🐧 Kernel", value=info.get("KERNEL", "N/A"), inline=False)
-        embed.add_field(name="🖥️ XRDP", value=xrdp_status, inline=True)
+        ram_used = safe_int(info.get("RAM_USED",0))
+        ram_total = safe_int(info.get("RAM_TOTAL",1)) or 1
+        ram_percent = round((ram_used/ram_total)*100)
+        ram_bar = ("█"*(ram_percent//10)).ljust(10,"░")
+        disk_percent_num = safe_int(info.get("DISK_PERCENT","0").replace("%",""))
+        disk_bar = ("█"*(disk_percent_num//10)).ljust(10,"░")
+        embed = discord.Embed(title="🖥️ VPS Info", description=f"**{info.get('HOSTNAME','N/A')}**\n🐧 {info.get('OS','N/A')}", color=0x3498db)
+        embed.add_field(name="🌐 Public IP", value=f"`{info.get('PUBLIC_IP','N/A')}`", inline=True)
+        embed.add_field(name="⏱️ Uptime", value=info.get("UPTIME","N/A"), inline=True)
+        embed.add_field(name="🔗 SSH", value="🟢 Active" if is_ssh_active() else "🔴 Inactive", inline=True)
+        embed.add_field(name="⚙️ CPU", value=info.get("CPU","N/A"), inline=False)
+        embed.add_field(name="🧵 Cores", value=info.get("CPU_CORES","N/A"), inline=True)
+        embed.add_field(name="📈 Load", value=info.get("LOAD","N/A"), inline=True)
+        embed.add_field(name="🏓 Ping", value=f"{info.get('PING','N/A')} ms", inline=True)
+        embed.add_field(name=f"🧠 RAM — {ram_used}MB/{ram_total}MB ({ram_percent}%)", value=f"`{ram_bar}` {ram_percent}%", inline=False)
+        embed.add_field(name=f"💾 Disk — {info.get('DISK_USED','N/A')}/{info.get('DISK_TOTAL','N/A')} ({info.get('DISK_PERCENT','N/A')})", value=f"`{disk_bar}` {info.get('DISK_PERCENT','N/A')}", inline=False)
+        embed.add_field(name="🐧 Kernel", value=info.get("KERNEL","N/A"), inline=False)
+        embed.add_field(name="🖥️ XRDP", value="🟢 Installed" if is_xrdp_installed() else "🔴 Not Installed", inline=True)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
 
     # ─── !ping ───────────────────────────────────────────────
     elif cmd == "!ping":
-        msg = await message.reply("🏓 Pinging servers...")
+        msg = await message.reply("🏓 Pinging...")
         stdout, _ = run_script(PING_SCRIPT)
         info = parse_info(stdout)
-        bot_latency = round(client.latency * 1000)
-        def ping_emoji(val):
+        bot_latency = round(client.latency*1000)
+        def pe(val):
             try:
                 p = float(val)
-                return "🟢" if p < 20 else "🟡" if p < 60 else "🔴"
+                return "🟢" if p<20 else "🟡" if p<60 else "🔴"
             except: return "⚪"
-        g, c, gh = info.get("GOOGLE","N/A"), info.get("CLOUDFLARE","N/A"), info.get("GITHUB","N/A")
+        g,c,gh = info.get("GOOGLE","N/A"),info.get("CLOUDFLARE","N/A"),info.get("GITHUB","N/A")
         embed = discord.Embed(title="🏓 Ping Results", color=0x1abc9c)
         embed.add_field(name="🤖 Bot Latency", value=f"`{bot_latency}ms`", inline=False)
-        embed.add_field(name=f"{ping_emoji(g)} Google (8.8.8.8)", value=f"`{g} ms`", inline=True)
-        embed.add_field(name=f"{ping_emoji(c)} Cloudflare (1.1.1.1)", value=f"`{c} ms`", inline=True)
-        embed.add_field(name=f"{ping_emoji(gh)} GitHub", value=f"`{gh} ms`", inline=True)
-        embed.set_footer(text="🟢 <20ms  🟡 <60ms  🔴 60ms+  • Auto-deletes in 20 seconds")
+        embed.add_field(name=f"{pe(g)} Google", value=f"`{g} ms`", inline=True)
+        embed.add_field(name=f"{pe(c)} Cloudflare", value=f"`{c} ms`", inline=True)
+        embed.add_field(name=f"{pe(gh)} GitHub", value=f"`{gh} ms`", inline=True)
+        embed.set_footer(text="🟢<20ms 🟡<60ms 🔴60ms+ • Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
 
@@ -661,8 +624,8 @@ async def on_message(message):
         stdout, _ = run_script('echo "UPTIME=$(uptime -p)" && echo "LOAD=$(uptime | awk -F\'load average:\' \'{print $2}\' | xargs)"')
         info = parse_info(stdout)
         embed = discord.Embed(title="⏱️ VPS Uptime", color=0xf39c12)
-        embed.add_field(name="🕐 Uptime", value=info.get("UPTIME", "N/A"), inline=False)
-        embed.add_field(name="📈 Load Average", value=info.get("LOAD", "N/A"), inline=False)
+        embed.add_field(name="🕐 Uptime", value=info.get("UPTIME","N/A"), inline=False)
+        embed.add_field(name="📈 Load", value=info.get("LOAD","N/A"), inline=False)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         reply = await message.reply(embed=embed)
         asyncio.ensure_future(auto_delete(reply, message))
@@ -671,7 +634,7 @@ async def on_message(message):
     elif cmd == "!ram":
         stdout, _ = run_script("free -m")
         embed = discord.Embed(title="🧠 RAM Usage", color=0x9b59b6)
-        embed.add_field(name="📊 Raw Output", value=f"```{stdout}```", inline=False)
+        embed.add_field(name="📊 Output", value=f"```{stdout}```", inline=False)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         reply = await message.reply(embed=embed)
         asyncio.ensure_future(auto_delete(reply, message))
@@ -680,32 +643,27 @@ async def on_message(message):
     elif cmd == "!disk":
         stdout, _ = run_script("df -h")
         embed = discord.Embed(title="💾 Disk Usage", color=0xe67e22)
-        embed.add_field(name="📊 Raw Output", value=f"```{stdout}```", inline=False)
+        embed.add_field(name="📊 Output", value=f"```{stdout}```", inline=False)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         reply = await message.reply(embed=embed)
         asyncio.ensure_future(auto_delete(reply, message))
 
     # ─── !datacenter ─────────────────────────────────────────
     elif cmd == "!datacenter":
-        msg = await message.reply("🌍 Fetching datacenter location...")
+        msg = await message.reply("🌍 Fetching location...")
         stdout, _ = run_script(DATACENTER_SCRIPT, timeout=30)
         info = parse_info(stdout)
-        country_flags = {
-            "US":"🇺🇸","GB":"🇬🇧","DE":"🇩🇪","FR":"🇫🇷","JP":"🇯🇵","SG":"🇸🇬",
-            "IN":"🇮🇳","AU":"🇦🇺","NL":"🇳🇱","CA":"🇨🇦","BR":"🇧🇷","KR":"🇰🇷",
-            "TW":"🇹🇼","HK":"🇭🇰","ID":"🇮🇩","MY":"🇲🇾","PH":"🇵🇭","TH":"🇹🇭",
-            "VN":"🇻🇳","RU":"🇷🇺","TR":"🇹🇷","PL":"🇵🇱","SE":"🇸🇪",
-        }
-        country = info.get("COUNTRY", "N/A")
-        flag = country_flags.get(country, "🌐")
-        embed = discord.Embed(title=f"{flag} VPS Datacenter Location", color=0x2ecc71)
-        embed.add_field(name="🌐 IP Address", value=f"`{info.get('IP', 'N/A')}`", inline=False)
-        embed.add_field(name="🏙️ City", value=info.get("CITY", "N/A"), inline=True)
-        embed.add_field(name="📍 Region", value=info.get("REGION", "N/A"), inline=True)
+        country_flags = {"US":"🇺🇸","GB":"🇬🇧","DE":"🇩🇪","FR":"🇫🇷","JP":"🇯🇵","SG":"🇸🇬","IN":"🇮🇳","AU":"🇦🇺","NL":"🇳🇱","CA":"🇨🇦","TW":"🇹🇼","HK":"🇭🇰","ID":"🇮🇩","MY":"🇲🇾","PH":"🇵🇭","TH":"🇹🇭","VN":"🇻🇳","RU":"🇷🇺","TR":"🇹🇷","PL":"🇵🇱","SE":"🇸🇪"}
+        country = info.get("COUNTRY","N/A")
+        flag = country_flags.get(country,"🌐")
+        embed = discord.Embed(title=f"{flag} Datacenter Location", color=0x2ecc71)
+        embed.add_field(name="🌐 IP", value=f"`{info.get('IP','N/A')}`", inline=False)
+        embed.add_field(name="🏙️ City", value=info.get("CITY","N/A"), inline=True)
+        embed.add_field(name="📍 Region", value=info.get("REGION","N/A"), inline=True)
         embed.add_field(name=f"{flag} Country", value=country, inline=True)
-        embed.add_field(name="🏢 ISP / Org", value=info.get("ORG", "N/A"), inline=False)
-        embed.add_field(name="🕐 Timezone", value=info.get("TIMEZONE", "N/A"), inline=True)
-        embed.add_field(name="📌 Coordinates", value=info.get("LOC", "N/A"), inline=True)
+        embed.add_field(name="🏢 ISP", value=info.get("ORG","N/A"), inline=False)
+        embed.add_field(name="🕐 Timezone", value=info.get("TIMEZONE","N/A"), inline=True)
+        embed.add_field(name="📌 Coordinates", value=info.get("LOC","N/A"), inline=True)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
@@ -717,20 +675,16 @@ async def on_message(message):
             embed = discord.Embed(title="🖥️ Virtual Machines", description="No VMs found. Use `!vmcreate` to create one.", color=0x95a5a6)
         else:
             embed = discord.Embed(title="🖥️ Virtual Machines", color=0x3498db)
-            for i, vm in enumerate(vms, 1):
+            for i, vm in enumerate(vms,1):
                 cfg = load_vm_config(vm)
                 running = is_vm_running(vm)
                 status = "🟢 Running" if running else "🔴 Stopped"
-                os_type = cfg.get("OS_TYPE", "N/A") if cfg else "N/A"
-                memory = cfg.get("MEMORY", "N/A") if cfg else "N/A"
-                cpus = cfg.get("CPUS", "N/A") if cfg else "N/A"
-                ssh_port = cfg.get("SSH_PORT", "N/A") if cfg else "N/A"
-                disk = cfg.get("DISK_SIZE", "N/A") if cfg else "N/A"
-                embed.add_field(
-                    name=f"{i}. {vm} — {status}",
-                    value=f"OS: `{os_type}` | RAM: `{memory}MB` | CPUs: `{cpus}` | Disk: `{disk}` | Port: `{ssh_port}`",
-                    inline=False
-                )
+                os_type = cfg.get("OS_TYPE","N/A") if cfg else "N/A"
+                memory = cfg.get("MEMORY","N/A") if cfg else "N/A"
+                cpus = cfg.get("CPUS","N/A") if cfg else "N/A"
+                ssh_port = cfg.get("SSH_PORT","N/A") if cfg else "N/A"
+                disk = cfg.get("DISK_SIZE","N/A") if cfg else "N/A"
+                embed.add_field(name=f"{i}. {vm} — {status}", value=f"OS: `{os_type}` | RAM: `{memory}MB` | CPUs: `{cpus}` | Disk: `{disk}` | Port: `{ssh_port}`", inline=False)
             embed.set_footer(text="Auto-deletes in 20 seconds")
         reply = await message.reply(embed=embed)
         asyncio.ensure_future(auto_delete(reply, message))
@@ -739,13 +693,13 @@ async def on_message(message):
     elif cmd.startswith("!vminfo"):
         parts = cmd.split()
         if len(parts) < 2:
-            embed = discord.Embed(title="❌ Missing VM Name", description="**Usage:** `!vminfo <vmname>`\n**Example:** `!vminfo myvm`", color=0xe74c3c)
+            embed = discord.Embed(title="❌ Missing VM Name", description="**Usage:** `!vminfo <vmname>`", color=0xe74c3c)
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message))
             return
         vm_name = parts[1]
         if not os.path.exists(os.path.join(VM_DIR, f"{vm_name}.conf")):
-            embed = discord.Embed(title="❌ VM Not Found", description=f"No VM named `{vm_name}`.\nUse `!vmlist` to see all VMs.", color=0xe74c3c)
+            embed = discord.Embed(title="❌ VM Not Found", description=f"No VM named `{vm_name}`.", color=0xe74c3c)
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message))
             return
@@ -761,55 +715,47 @@ async def on_message(message):
         valid_os = ", ".join(OS_OPTIONS.keys())
         example = "📋 **Example:**\n`!vmcreate myvm ubuntu22 20G 2048 2 3000 mypassword`\n\n**Format:** `!vmcreate <name> <os> <disk> <ram_mb> <cpus> <ssh_port> <password>`"
         os_list = f"**Available OS:**\n`{valid_os}`"
-
         if len(parts) < 7:
             embed = discord.Embed(title="❌ Invalid Format", description=f"{example}\n\n{os_list}", color=0xe74c3c)
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message))
             return
-
-        _, vm_name, os_key, disk_size, memory, cpus, ssh_port = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]
+        _, vm_name, os_key, disk_size, memory, cpus, ssh_port = parts[0],parts[1],parts[2],parts[3],parts[4],parts[5],parts[6]
         password = parts[7] if len(parts) >= 8 else ""
-
-        FORBIDDEN_PORTS = list(range(2222, 2231)) + [22,80,443,3389,3306,5432,6379,8080,8443,27017,5900,21,23,25,53,110,143]
+        FORBIDDEN_PORTS = list(range(2222,2231)) + [22,80,443,3389,3306,5432,6379,8080,8443,27017,5900,21,23,25,53,110,143]
         errors = []
-        if not re.match(r'^[a-zA-Z0-9_-]+$', vm_name): errors.append("VM name: letters, numbers, hyphens, underscores only")
+        if not re.match(r'^[a-zA-Z0-9_-]+$', vm_name): errors.append("VM name: letters, numbers, hyphens only")
         if os_key not in OS_OPTIONS: errors.append(f"Invalid OS. Choose from: `{valid_os}`")
-        if not re.match(r'^\d+[GgMm]$', disk_size): errors.append("Disk size must be like `20G` or `512M`")
-        if not memory.isdigit(): errors.append("RAM must be a number in MB like `2048`")
-        if not cpus.isdigit(): errors.append("CPUs must be a number like `2`")
-        if not ssh_port.isdigit() or not (1024 <= int(ssh_port) <= 65535):
-            errors.append("SSH port must be between 1024-65535")
-        elif int(ssh_port) in FORBIDDEN_PORTS:
-            errors.append(f"Port `{ssh_port}` is reserved.\nTry: `3000`, `4000`, `5000`, `7000`, `8888`, `9090`")
+        if not re.match(r'^\d+[GgMm]$', disk_size): errors.append("Disk size like `20G`")
+        if not memory.isdigit(): errors.append("RAM must be number like `2048`")
+        if not cpus.isdigit(): errors.append("CPUs must be number like `2`")
+        if not ssh_port.isdigit() or not (1024 <= int(ssh_port) <= 65535): errors.append("Port must be 1024-65535")
+        elif int(ssh_port) in FORBIDDEN_PORTS: errors.append(f"Port `{ssh_port}` is reserved. Try `3000`, `4000`, `5000`")
         elif ssh_port.isdigit():
-            pc = subprocess.run(["bash", "-c", f"ss -tlnp 2>/dev/null | grep ':{ssh_port} '"], capture_output=True, text=True)
-            if pc.stdout.strip(): errors.append(f"Port `{ssh_port}` is already in use. Choose another.")
-        if os.path.exists(os.path.join(VM_DIR, f"{vm_name}.conf")): errors.append(f"VM named `{vm_name}` already exists")
-
+            pc = subprocess.run(["bash","-c",f"ss -tlnp 2>/dev/null | grep ':{ssh_port} '"], capture_output=True, text=True)
+            if pc.stdout.strip(): errors.append(f"Port `{ssh_port}` already in use")
+        if os.path.exists(os.path.join(VM_DIR, f"{vm_name}.conf")): errors.append(f"VM `{vm_name}` already exists")
         if errors:
             embed = discord.Embed(title="❌ Invalid Input", description="\n".join(f"• {e}" for e in errors) + f"\n\n{example}\n\n{os_list}", color=0xe74c3c)
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message))
             return
-
         msg = await message.reply(embed=discord.Embed(title="⏳ Creating VM...", description=f"Setting up **{vm_name}** with `{os_key}`\nDownloading OS image...", color=0x3498db))
         loop = asyncio.get_event_loop()
         ok, err = await loop.run_in_executor(None, lambda: create_vm_files(vm_name, os_key, disk_size, memory, cpus, ssh_port, password))
-
         if ok:
             cfg = load_vm_config(vm_name)
-            username = cfg.get("USERNAME", "N/A") if cfg else "N/A"
-            final_pass = cfg.get("PASSWORD", password) if cfg else password
-            embed = discord.Embed(title="✅ VM Created!", description=f"**{vm_name}** is ready to start!", color=0x2ecc71)
+            username = cfg.get("USERNAME","N/A") if cfg else "N/A"
+            final_pass = cfg.get("PASSWORD",password) if cfg else password
+            embed = discord.Embed(title="✅ VM Created!", description=f"**{vm_name}** is ready!", color=0x2ecc71)
             embed.add_field(name="🖥️ OS", value=os_key, inline=True)
             embed.add_field(name="💾 Disk", value=disk_size, inline=True)
             embed.add_field(name="🧠 RAM", value=f"{memory}MB", inline=True)
             embed.add_field(name="🧵 CPUs", value=cpus, inline=True)
-            embed.add_field(name="🔌 SSH Port", value=ssh_port, inline=True)
+            embed.add_field(name="🔌 Port", value=ssh_port, inline=True)
             embed.add_field(name="👤 Username", value=username, inline=True)
             embed.add_field(name="🔑 Password", value=f"`{final_pass}`", inline=True)
-            embed.add_field(name="▶️ Start it", value=f"`!vmstart {vm_name}`", inline=False)
+            embed.add_field(name="▶️ Start", value=f"`!vmstart {vm_name}`", inline=False)
         else:
             embed = discord.Embed(title="❌ VM Creation Failed", description=f"```{err[:1000]}```", color=0xe74c3c)
         embed.set_footer(text="Auto-deletes in 20 seconds")
@@ -842,58 +788,49 @@ async def on_message(message):
             cfg = load_vm_config(vm_name)
             ssh_port = cfg.get("SSH_PORT","N/A") if cfg else "N/A"
             username = cfg.get("USERNAME","N/A") if cfg else "N/A"
-            embed = discord.Embed(title="✅ VM Started!", description=f"**{vm_name}** is booting...\nChecking when SSH is ready, please wait.", color=0x3498db)
+            password = cfg.get("PASSWORD","") if cfg else ""
+            embed = discord.Embed(title="✅ VM Started!", description=f"**{vm_name}** is booting...\nYou'll get a **🟢 Ready** notification when SSH is available.", color=0x3498db)
             embed.add_field(name="🔌 SSH Port", value=ssh_port, inline=True)
             embed.add_field(name="👤 Username", value=username, inline=True)
-            embed.set_footer(text="Waiting for VM to boot...")
+            embed.set_footer(text="Auto-deletes in 20 seconds")
             await msg.edit(content=None, embed=embed)
+            asyncio.ensure_future(auto_delete(msg, message))
 
-            # Wait for SSH port to open and notify user
             async def wait_and_notify():
-                import time
-                port = cfg.get("SSH_PORT", "2222") if cfg else "2222"
-                for _ in range(40):  # wait up to 2 minutes
+                port = ssh_port
+                uname = username
+                pw = password
+                for _ in range(60):
                     await asyncio.sleep(5)
                     check = subprocess.run(
-                        ["bash", "-c", f"(echo > /dev/tcp/localhost/{port}) 2>/dev/null && echo open || echo closed"],
+                        ["bash","-c",f"sshpass -p '{pw}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no -p {port} {uname}@localhost echo connected 2>/dev/null"],
                         capture_output=True, text=True
                     )
-                    if "open" in check.stdout:
-                        ready_embed = discord.Embed(
-                            title="🟢 VM is Ready!",
-                            description=f"**{vm_name}** has booted and SSH is available! You can now connect.",
-                            color=0x2ecc71
-                        )
-                        ready_embed.add_field(name="🔑 Connect", value=f"`!vmssh {vm_name}`", inline=False)
+                    if "connected" in check.stdout:
+                        ready_embed = discord.Embed(title="🟢 VM is Ready!", description=f"**{vm_name}** has fully booted! SSH is accepting connections.", color=0x2ecc71)
+                        ready_embed.add_field(name="🔑 Connect now", value=f"`!vmssh {vm_name}`", inline=False)
                         ready_embed.set_footer(text="Auto-deletes in 30 seconds")
                         try:
                             notify_msg = await message.channel.send(embed=ready_embed)
                             await asyncio.sleep(30)
                             try: await notify_msg.delete()
                             except: pass
-                        except:
-                            pass
+                        except: pass
                         return
-                # If never came up after 2 min
                 try:
-                    timeout_embed = discord.Embed(
-                        title="⚠️ VM Taking Long to Boot",
-                        description=f"**{vm_name}** is taking longer than expected.\nTry `!vmssh {vm_name}` manually.",
-                        color=0xfee75c
-                    )
+                    timeout_embed = discord.Embed(title="⚠️ VM Taking Long", description=f"**{vm_name}** is taking longer than expected.\nTry `!vmssh {vm_name}` manually in a few minutes.", color=0xfee75c)
                     timeout_msg = await message.channel.send(embed=timeout_embed)
                     await asyncio.sleep(20)
                     try: await timeout_msg.delete()
                     except: pass
-                except:
-                    pass
+                except: pass
 
             asyncio.ensure_future(wait_and_notify())
         else:
             embed = discord.Embed(title="❌ Failed to Start VM", description=f"```{err}```", color=0xe74c3c)
-        embed.set_footer(text="Auto-deletes in 20 seconds")
-        await msg.edit(content=None, embed=embed)
-        asyncio.ensure_future(auto_delete(msg, message))
+            embed.set_footer(text="Auto-deletes in 20 seconds")
+            await msg.edit(content=None, embed=embed)
+            asyncio.ensure_future(auto_delete(msg, message))
 
     # ─── !vmstop ─────────────────────────────────────────────
     elif cmd.startswith("!vmstop"):
@@ -905,12 +842,12 @@ async def on_message(message):
             return
         vm_name = parts[1]
         if not is_vm_running(vm_name):
-            embed = discord.Embed(title="ℹ️ Not Running", description=f"`{vm_name}` is not currently running.", color=0x95a5a6)
+            embed = discord.Embed(title="ℹ️ Not Running", description=f"`{vm_name}` is not running.", color=0x95a5a6)
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message))
             return
         stop_vm_proc(vm_name)
-        embed = discord.Embed(title="⏹️ VM Stopped", description=f"**{vm_name}** has been stopped.", color=0xe67e22)
+        embed = discord.Embed(title="⏹️ VM Stopped", description=f"**{vm_name}** stopped.", color=0xe67e22)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         reply = await message.reply(embed=embed)
         asyncio.ensure_future(auto_delete(reply, message))
@@ -945,13 +882,11 @@ async def on_message(message):
             cfg2 = load_vm_config(vm_name)
             port2 = cfg2.get("SSH_PORT","?") if cfg2 else "?"
             user2 = cfg2.get("USERNAME","?") if cfg2 else "?"
-            sp = subprocess.run(["bash","-c","command -v sshpass"],capture_output=True)
-            sshpass_ok = "✅ Installed" if sp.returncode==0 else "❌ Not installed — run `apt install sshpass`"
-            pc = subprocess.run(["bash","-c",f"(echo > /dev/tcp/localhost/{port2}) 2>/dev/null && echo open || echo closed"],capture_output=True,text=True)
-            port_status = pc.stdout.strip()
+            sp = subprocess.run(["bash","-c","command -v sshpass"], capture_output=True)
+            sshpass_ok = "✅ Installed" if sp.returncode==0 else "❌ Not installed"
             embed = discord.Embed(title="❌ SSH Failed", description=f"Could not connect to **{vm_name}**.", color=0xe74c3c)
-            embed.add_field(name="🔍 Debug Info", value=f"Port: `{port2}` — `{port_status}`\nUser: `{user2}`\nsshpass: {sshpass_ok}", inline=False)
-            embed.add_field(name="💡 Fixes", value="• Port `closed` = VM still booting, wait 2-3 min\n• Install sshpass if missing\n• Run `!vmstart` to confirm VM is running", inline=False)
+            embed.add_field(name="🔍 Debug", value=f"Port: `{port2}` | User: `{user2}` | sshpass: {sshpass_ok}", inline=False)
+            embed.add_field(name="💡 Fixes", value="• VM still booting — wait and retry\n• Run `!vmstart` to confirm running", inline=False)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
@@ -967,36 +902,34 @@ async def on_message(message):
         vm_name = parts[1]
         user_id = message.author.id
         if not os.path.exists(os.path.join(VM_DIR, f"{vm_name}.conf")):
-            embed = discord.Embed(title="❌ VM Not Found", description=f"No VM named `{vm_name}`.", color=0xe74c3c)
+            embed = discord.Embed(title="❌ VM Not Found", color=0xe74c3c)
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message))
             return
         state = pending_deletes.get(user_id, {})
         if state.get("vm_name") != vm_name:
             pending_deletes[user_id] = {"vm_name": vm_name, "step": 1}
-            embed = discord.Embed(title="⚠️ Confirm Delete — Step 1/2", description=f"Are you sure you want to delete **{vm_name}**?\nThis will **permanently delete** all data.\n\nType `!vmdelete {vm_name}` again to confirm.", color=0xfee75c)
+            embed = discord.Embed(title="⚠️ Confirm Delete — Step 1/2", description=f"Delete **{vm_name}**? This is **permanent**.\n\nType `!vmdelete {vm_name}` again to confirm.", color=0xfee75c)
             embed.set_footer(text="Expires in 30 seconds")
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message, delay=30))
-            async def cancel_delete(uid, vname):
+            async def cancel1(uid, vname):
                 await asyncio.sleep(30)
-                if pending_deletes.get(uid, {}).get("vm_name") == vname:
-                    pending_deletes.pop(uid, None)
-            asyncio.ensure_future(cancel_delete(user_id, vm_name))
+                if pending_deletes.get(uid,{}).get("vm_name") == vname: pending_deletes.pop(uid,None)
+            asyncio.ensure_future(cancel1(user_id, vm_name))
         elif state.get("step") == 1:
             pending_deletes[user_id] = {"vm_name": vm_name, "step": 2}
-            embed = discord.Embed(title="🚨 Final Warning — Step 2/2", description=f"**THIS IS YOUR LAST CHANCE.**\nDeleting **{vm_name}** is **irreversible**.\n\nType `!vmdelete {vm_name}` ONE MORE TIME to permanently delete.", color=0xe74c3c)
+            embed = discord.Embed(title="🚨 Final Warning — Step 2/2", description=f"**LAST CHANCE.** Deleting **{vm_name}** is irreversible.\n\nType `!vmdelete {vm_name}` ONE MORE TIME.", color=0xe74c3c)
             embed.set_footer(text="Expires in 30 seconds")
             reply = await message.reply(embed=embed)
             asyncio.ensure_future(auto_delete(reply, message, delay=30))
-            async def cancel_delete2(uid, vname):
+            async def cancel2(uid, vname):
                 await asyncio.sleep(30)
-                if pending_deletes.get(uid, {}).get("vm_name") == vname:
-                    pending_deletes.pop(uid, None)
-            asyncio.ensure_future(cancel_delete2(user_id, vm_name))
+                if pending_deletes.get(uid,{}).get("vm_name") == vname: pending_deletes.pop(uid,None)
+            asyncio.ensure_future(cancel2(user_id, vm_name))
         elif state.get("step") == 2:
             pending_deletes.pop(user_id, None)
-            msg = await message.reply(embed=discord.Embed(title="🗑️ Deleting VM...", description=f"Stopping and deleting **{vm_name}**...", color=0xe67e22))
+            msg = await message.reply(embed=discord.Embed(title="🗑️ Deleting VM...", color=0xe67e22))
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: delete_vm_files(vm_name))
             embed = discord.Embed(title="✅ VM Deleted", description=f"**{vm_name}** permanently deleted.", color=0x2ecc71)
@@ -1007,7 +940,7 @@ async def on_message(message):
     # ─── !xrdp ───────────────────────────────────────────────
     elif cmd == "!xrdp":
         if not is_xrdp_installed():
-            msg = await message.reply(embed=discord.Embed(title="⏳ Installing XRDP", description="Starting installation...", color=0x3498db))
+            msg = await message.reply(embed=discord.Embed(title="⏳ Installing XRDP", description=f"Starting installation on `{HOST_OS}`...", color=0x3498db))
             success, err = await install_xrdp_with_progress(msg)
             if not success:
                 embed = discord.Embed(title="❌ XRDP Install Failed", description=f"```{err[:1000]}```", color=0xe74c3c)
@@ -1016,21 +949,19 @@ async def on_message(message):
                 return
         else:
             msg = await message.reply(embed=discord.Embed(title="✅ XRDP Already Installed", description="Starting Pinggy tunnel...", color=0x2ecc71))
-        if is_pinggy_running():
-            kill_pinggy()
-            await asyncio.sleep(2)
-        await msg.edit(embed=discord.Embed(title="🔗 Starting Tunnel...", description="Connecting to Pinggy...", color=0x3498db))
+        if is_pinggy_running(): kill_pinggy(); await asyncio.sleep(2)
+        await msg.edit(embed=discord.Embed(title="🔗 Starting Tunnel...", color=0x3498db))
         loop = asyncio.get_event_loop()
         url = await loop.run_in_executor(None, start_pinggy_and_get_url)
         if url:
-            embed = discord.Embed(title="🖥️ Remote Desktop Ready", description="Open **Remote Desktop Connection** (RD Client) and connect!", color=0x2ecc71)
+            embed = discord.Embed(title="🖥️ Remote Desktop Ready", description="Open **RD Client** and connect!", color=0x2ecc71)
             embed.add_field(name="🔗 RD Client Address", value=f"```{url}```", inline=False)
             embed.add_field(name="👤 Username", value="`root` (or your VPS user)", inline=True)
             embed.add_field(name="🔑 Password", value="Your VPS root password", inline=True)
-            embed.add_field(name="💡 Tip", value="Paste address exactly — no `tcp://` prefix", inline=False)
+            embed.add_field(name="💡 Tip", value="No `tcp://` prefix needed", inline=False)
             embed.set_footer(text="Auto-deletes in 20 seconds • !startxrdp to restart • !delxrdp to remove")
         else:
-            embed = discord.Embed(title="⚠️ Tunnel Started (URL not captured)", description="Check `/tmp/pinggy.log` on VPS.", color=0xfee75c)
+            embed = discord.Embed(title="⚠️ URL Not Captured", description="Check `/tmp/pinggy.log`", color=0xfee75c)
             embed.add_field(name="Manual check", value="```cat /tmp/pinggy.log```", inline=False)
             embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
@@ -1044,19 +975,15 @@ async def on_message(message):
             asyncio.ensure_future(auto_delete(reply, message))
             return
         msg = await message.reply(embed=discord.Embed(title="🔗 Restarting Tunnel...", color=0x3498db))
-        if is_pinggy_running():
-            kill_pinggy()
-            await asyncio.sleep(2)
-        subprocess.run(["bash", "-c", "/etc/init.d/xrdp start 2>/dev/null"], capture_output=True)
+        if is_pinggy_running(): kill_pinggy(); await asyncio.sleep(2)
+        subprocess.run(["bash","-c","/etc/init.d/xrdp start 2>/dev/null"], capture_output=True)
         loop = asyncio.get_event_loop()
         url = await loop.run_in_executor(None, start_pinggy_and_get_url)
         if url:
             embed = discord.Embed(title="🔗 Tunnel Restarted", color=0x2ecc71)
             embed.add_field(name="🖥️ RD Client Address", value=f"```{url}```", inline=False)
-            embed.add_field(name="💡 Tip", value="No `tcp://` prefix needed", inline=False)
         else:
             embed = discord.Embed(title="⚠️ URL Not Captured", description="Check `/tmp/pinggy.log`", color=0xfee75c)
-            embed.add_field(name="Manual check", value="```cat /tmp/pinggy.log```", inline=False)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
@@ -1065,18 +992,18 @@ async def on_message(message):
     elif cmd == "!stopxrdp":
         msg = await message.reply(embed=discord.Embed(title="⏹️ Stopping XRDP...", color=0xe67e22))
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: run_script('pkill -f "tcp@a.pinggy.io" 2>/dev/null; systemctl stop xrdp 2>/dev/null; /etc/init.d/xrdp stop 2>/dev/null', timeout=30))
-        embed = discord.Embed(title="⏹️ XRDP Stopped", description="Tunnel killed and XRDP stopped.\nXRDP still **installed** — run `!xrdp` to start again.", color=0xe67e22)
+        await loop.run_in_executor(None, lambda: run_script('pkill -f "tcp@a.pinggy.io" 2>/dev/null; systemctl stop xrdp 2>/dev/null', timeout=30))
+        embed = discord.Embed(title="⏹️ XRDP Stopped", description="Tunnel killed and XRDP stopped.\nRun `!xrdp` to start again.", color=0xe67e22)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
 
     # ─── !xrdpfix ────────────────────────────────────────────
     elif cmd == "!xrdpfix":
-        msg = await message.reply(embed=discord.Embed(title="🔧 Fixing XRDP Session...", color=0x3498db))
+        msg = await message.reply(embed=discord.Embed(title="🔧 Fixing XRDP...", color=0x3498db))
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: run_script('echo "xfce4-session" > ~/.xsession; chmod +x ~/.xsession; systemctl restart xrdp 2>/dev/null; /etc/init.d/xrdp restart 2>/dev/null', timeout=30))
-        embed = discord.Embed(title="✅ XRDP Fixed", description="Session file restored. Run `!startxrdp` for fresh URL.", color=0x2ecc71)
+        embed = discord.Embed(title="✅ XRDP Fixed", description="Run `!startxrdp` for fresh URL.", color=0x2ecc71)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
@@ -1092,47 +1019,42 @@ async def on_message(message):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: run_script(DEL_XRDP_SCRIPT, timeout=120))
         embed = discord.Embed(title="🔴 XRDP Removed", description="XRDP, XFCE, Firefox and tunnel removed.", color=0xe67e22)
-        embed.add_field(name="💡 Note", value="Run `!xrdp` to reinstall anytime.", inline=False)
         embed.set_footer(text="Auto-deletes in 20 seconds")
         await msg.edit(content=None, embed=embed)
         asyncio.ensure_future(auto_delete(msg, message))
 
     # ─── !help ───────────────────────────────────────────────
     elif cmd == "!help":
-        embed = discord.Embed(title="🤖 Bot Commands", description="All commands work in **DMs and servers** • Owner only 🔒", color=0x9b59b6)
-        embed.add_field(name="🔐 `!ssh`", value="Generate fresh SSH session link", inline=False)
-        embed.add_field(name="🔴 `!delssh`", value="Kill active SSH session", inline=False)
-        embed.add_field(name="🖥️ `!vpsinfo`", value="Full VPS stats (RAM, CPU, Disk, IP...)", inline=False)
-        embed.add_field(name="🏓 `!ping`", value="Ping Google, Cloudflare, GitHub + bot latency", inline=False)
-        embed.add_field(name="⏱️ `!uptime`", value="VPS uptime and load average", inline=False)
-        embed.add_field(name="🧠 `!ram`", value="Quick RAM usage", inline=False)
-        embed.add_field(name="💾 `!disk`", value="Disk usage breakdown", inline=False)
-        embed.add_field(name="🌍 `!datacenter`", value="Show VPS datacenter city, country, ISP", inline=False)
+        embed = discord.Embed(title="🤖 Bot Commands", description=f"Owner only 🔒 • DMs never deleted • Host OS: `{HOST_OS}`", color=0x9b59b6)
+        embed.add_field(name="🔐 `!ssh`", value="Fresh SSH link", inline=False)
+        embed.add_field(name="🔴 `!delssh`", value="Kill SSH session", inline=False)
+        embed.add_field(name="🖥️ `!vpsinfo`", value="Full VPS stats", inline=False)
+        embed.add_field(name="🏓 `!ping`", value="Ping servers + bot latency", inline=False)
+        embed.add_field(name="⏱️ `!uptime`", value="VPS uptime", inline=False)
+        embed.add_field(name="🧠 `!ram`", value="RAM usage", inline=False)
+        embed.add_field(name="💾 `!disk`", value="Disk usage", inline=False)
+        embed.add_field(name="🌍 `!datacenter`", value="Datacenter location", inline=False)
         embed.add_field(name="━━━━━━━━ VM Commands ━━━━━━━━", value="\u200b", inline=False)
-        embed.add_field(name="📋 `!vmlist`", value="List all VMs with status", inline=False)
-        embed.add_field(name="ℹ️ `!vminfo <name>`", value="Full details of a VM (RAM, disk, ping, uptime, created date)", inline=False)
-        embed.add_field(name="➕ `!vmcreate <name> <os> <disk> <ram> <cpus> <port> [pass]`", value="Create VM\nExample: `!vmcreate myvm ubuntu22 20G 2048 2 3000`\nOS: `ubuntu22, ubuntu24, debian11, debian12, fedora40, centos9, almalinux9, rocky9`", inline=False)
-        embed.add_field(name="▶️ `!vmstart <name>`", value="Start a VM", inline=False)
-        embed.add_field(name="⏹️ `!vmstop <name>`", value="Stop a running VM", inline=False)
-        embed.add_field(name="🔑 `!vmssh <name>`", value="Get tmate SSH link inside a VM", inline=False)
-        embed.add_field(name="🗑️ `!vmdelete <name>`", value="Delete VM permanently (double confirmation)", inline=False)
+        embed.add_field(name="📋 `!vmlist`", value="List all VMs", inline=False)
+        embed.add_field(name="ℹ️ `!vminfo <name>`", value="Full VM details", inline=False)
+        embed.add_field(name="➕ `!vmcreate <name> <os> <disk> <ram> <cpus> <port> [pass]`", value="Create VM\nOS: `ubuntu22, ubuntu24, debian11, debian12, fedora40, centos9, almalinux9, rocky9`", inline=False)
+        embed.add_field(name="▶️ `!vmstart <name>`", value="Start VM (notifies when ready)", inline=False)
+        embed.add_field(name="⏹️ `!vmstop <name>`", value="Stop VM", inline=False)
+        embed.add_field(name="🔑 `!vmssh <name>`", value="Get SSH link for VM", inline=False)
+        embed.add_field(name="🗑️ `!vmdelete <name>`", value="Delete VM (double confirm)", inline=False)
         embed.add_field(name="━━━━━━━━ XRDP Commands ━━━━━━━━", value="\u200b", inline=False)
-        embed.add_field(name="🖥️ `!xrdp`", value="Install XRDP + start Pinggy tunnel", inline=False)
-        embed.add_field(name="🔗 `!startxrdp`", value="Restart Pinggy tunnel only", inline=False)
-        embed.add_field(name="⏹️ `!stopxrdp`", value="Stop XRDP and kill tunnel", inline=False)
-        embed.add_field(name="🔧 `!xrdpfix`", value="Fix XRDP session file", inline=False)
-        embed.add_field(name="🗑️ `!delxrdp`", value="Remove XRDP, XFCE, Firefox and tunnel", inline=False)
-        embed.add_field(name="❓ `!help`", value="Show this message", inline=False)
-        embed.set_footer(text="Auto-deletes in 20 seconds • DM messages never deleted")
+        embed.add_field(name="🖥️ `!xrdp`", value="Install XRDP + tunnel (auto-detects OS)", inline=False)
+        embed.add_field(name="🔗 `!startxrdp`", value="Restart tunnel only", inline=False)
+        embed.add_field(name="⏹️ `!stopxrdp`", value="Stop XRDP + tunnel", inline=False)
+        embed.add_field(name="🔧 `!xrdpfix`", value="Fix XRDP session", inline=False)
+        embed.add_field(name="🗑️ `!delxrdp`", value="Remove XRDP completely", inline=False)
+        embed.set_footer(text="Auto-deletes in 20 seconds • Also available as / commands")
         reply = await message.reply(embed=embed)
         asyncio.ensure_future(auto_delete(reply, message))
 
 
 # ── Slash Commands ───────────────────────────────────────────────────────────
-
-def slash_auth(interaction):
-    return interaction.user.id == YOUR_USER_ID
-
+def slash_auth(interaction): return interaction.user.id == YOUR_USER_ID
 async def slash_unauth(interaction):
     await interaction.response.send_message(embed=discord.Embed(title="🚫 Unauthorised", color=0xe74c3c), ephemeral=True)
 
@@ -1143,7 +1065,7 @@ async def slash_ssh(interaction: discord.Interaction):
     if is_ssh_active(): run_script(DEL_SSH_SCRIPT)
     stdout, stderr = run_script(SSH_SCRIPT)
     if stdout:
-        embed = discord.Embed(title="🔐 SSH Session Ready", description="Paste in Termux!", color=0x2ecc71)
+        embed = discord.Embed(title="🔐 SSH Session Ready", color=0x2ecc71)
         embed.add_field(name="📡 SSH Command", value=f"```{stdout}```", inline=False)
         embed.set_footer(text="Only visible to you")
     else:
@@ -1167,12 +1089,12 @@ async def slash_vpsinfo(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     stdout, _ = run_script(VPS_INFO_SCRIPT)
     info = parse_info(stdout)
-    ram_used = safe_int(info.get("RAM_USED", 0))
-    ram_total = safe_int(info.get("RAM_TOTAL", 1)) or 1
-    ram_percent = round((ram_used / ram_total) * 100)
-    ram_bar = ("█" * (ram_percent // 10)).ljust(10, "░")
-    disk_percent_num = safe_int(info.get("DISK_PERCENT", "0").replace("%", ""))
-    disk_bar = ("█" * (disk_percent_num // 10)).ljust(10, "░")
+    ram_used = safe_int(info.get("RAM_USED",0))
+    ram_total = safe_int(info.get("RAM_TOTAL",1)) or 1
+    ram_percent = round((ram_used/ram_total)*100)
+    ram_bar = ("█"*(ram_percent//10)).ljust(10,"░")
+    disk_percent_num = safe_int(info.get("DISK_PERCENT","0").replace("%",""))
+    disk_bar = ("█"*(disk_percent_num//10)).ljust(10,"░")
     embed = discord.Embed(title="🖥️ VPS Info", description=f"**{info.get('HOSTNAME','N/A')}**\n🐧 {info.get('OS','N/A')}", color=0x3498db)
     embed.add_field(name="🌐 IP", value=f"`{info.get('PUBLIC_IP','N/A')}`", inline=True)
     embed.add_field(name="⏱️ Uptime", value=info.get("UPTIME","N/A"), inline=True)
@@ -1192,13 +1114,12 @@ async def slash_ping(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     stdout, _ = run_script(PING_SCRIPT)
     info = parse_info(stdout)
-    bot_latency = round(client.latency * 1000)
+    bot_latency = round(client.latency*1000)
     def pe(val):
         try:
-            p = float(val)
-            return "🟢" if p < 20 else "🟡" if p < 60 else "🔴"
+            p=float(val); return "🟢" if p<20 else "🟡" if p<60 else "🔴"
         except: return "⚪"
-    g, c, gh = info.get("GOOGLE","N/A"), info.get("CLOUDFLARE","N/A"), info.get("GITHUB","N/A")
+    g,c,gh = info.get("GOOGLE","N/A"),info.get("CLOUDFLARE","N/A"),info.get("GITHUB","N/A")
     embed = discord.Embed(title="🏓 Ping Results", color=0x1abc9c)
     embed.add_field(name="🤖 Bot", value=f"`{bot_latency}ms`", inline=True)
     embed.add_field(name=f"{pe(g)} Google", value=f"`{g} ms`", inline=True)
@@ -1262,7 +1183,7 @@ async def slash_vmlist(interaction: discord.Interaction):
         embed = discord.Embed(title="🖥️ Virtual Machines", description="No VMs found.", color=0x95a5a6)
     else:
         embed = discord.Embed(title="🖥️ Virtual Machines", color=0x3498db)
-        for i, vm in enumerate(vms, 1):
+        for i, vm in enumerate(vms,1):
             cfg = load_vm_config(vm)
             running = is_vm_running(vm)
             status = "🟢 Running" if running else "🔴 Stopped"
@@ -1275,6 +1196,7 @@ async def slash_vmlist(interaction: discord.Interaction):
 
 @tree.command(name="vminfo", description="Show full details of a VM")
 @app_commands.describe(name="VM name")
+@app_commands.autocomplete(name=vm_name_autocomplete)
 async def slash_vminfo(interaction: discord.Interaction, name: str):
     if not slash_auth(interaction): await slash_unauth(interaction); return
     await interaction.response.defer(ephemeral=True)
@@ -1299,10 +1221,10 @@ async def slash_vminfo(interaction: discord.Interaction, name: str):
 async def slash_vmcreate(interaction: discord.Interaction, name: str, os: str, disk: str, ram: str, cpus: str, port: str, password: str = ""):
     if not slash_auth(interaction): await slash_unauth(interaction); return
     await interaction.response.defer(ephemeral=True)
-    FORBIDDEN_PORTS = list(range(2222, 2231)) + [22,80,443,3389,3306,5432,6379,8080,8443,27017,5900,21,23,25,53,110,143]
+    FORBIDDEN_PORTS = list(range(2222,2231)) + [22,80,443,3389,3306,5432,6379,8080,8443,27017,5900,21,23,25,53,110,143]
     errors = []
     if not re.match(r"^[a-zA-Z0-9_-]+$", name): errors.append("VM name: letters, numbers, hyphens only")
-    if not re.match(r"^\d+[GgMm]$", disk): errors.append("Disk: must be like `20G`")
+    if not re.match(r"^\d+[GgMm]$", disk): errors.append("Disk: like `20G`")
     if not ram.isdigit(): errors.append("RAM: number like `2048`")
     if not cpus.isdigit(): errors.append("CPUs: number like `2`")
     if not port.isdigit() or not (1024 <= int(port) <= 65535): errors.append("Port: 1024-65535")
@@ -1322,12 +1244,14 @@ async def slash_vmcreate(interaction: discord.Interaction, name: str, os: str, d
         embed.add_field(name="🔌 Port", value=port, inline=True)
         embed.add_field(name="👤 User", value=cfg.get("USERNAME","N/A") if cfg else "N/A", inline=True)
         embed.add_field(name="🔑 Password", value=f"`{cfg.get('PASSWORD',password) if cfg else password}`", inline=True)
+        embed.add_field(name="▶️ Start", value=f"Use `/vmstart` with name `{name}`", inline=False)
     else:
         embed = discord.Embed(title="❌ VM Creation Failed", description=f"```{err[:1000]}```", color=0xe74c3c)
     await interaction.edit_original_response(embed=embed)
 
 @tree.command(name="vmstart", description="Start a VM")
 @app_commands.describe(name="VM name to start")
+@app_commands.autocomplete(name=vm_name_autocomplete)
 async def slash_vmstart(interaction: discord.Interaction, name: str):
     if not slash_auth(interaction): await slash_unauth(interaction); return
     await interaction.response.defer(ephemeral=True)
@@ -1339,31 +1263,34 @@ async def slash_vmstart(interaction: discord.Interaction, name: str):
     ok, err = await loop.run_in_executor(None, lambda: start_vm_background(name))
     if ok:
         cfg = load_vm_config(name)
-        embed = discord.Embed(title="✅ VM Started!", description=f"**{name}** is booting...\nYou'll get a message when SSH is ready.", color=0x3498db)
-        embed.add_field(name="🔌 Port", value=cfg.get("SSH_PORT","N/A") if cfg else "N/A", inline=True)
+        pw = cfg.get("PASSWORD","") if cfg else ""
+        uname = cfg.get("USERNAME","ubuntu") if cfg else "ubuntu"
+        port = cfg.get("SSH_PORT","2222") if cfg else "2222"
+        embed = discord.Embed(title="✅ VM Started!", description=f"**{name}** is booting...\nYou'll get a notification when SSH is ready.", color=0x3498db)
+        embed.add_field(name="🔌 Port", value=port, inline=True)
 
-        async def slash_wait_notify():
-            port = cfg.get("SSH_PORT", "2222") if cfg else "2222"
-            for _ in range(40):
+        async def slash_notify():
+            for _ in range(60):
                 await asyncio.sleep(5)
                 check = subprocess.run(
-                    ["bash", "-c", f"(echo > /dev/tcp/localhost/{port}) 2>/dev/null && echo open || echo closed"],
+                    ["bash","-c",f"sshpass -p '{pw}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no -p {port} {uname}@localhost echo connected 2>/dev/null"],
                     capture_output=True, text=True
                 )
-                if "open" in check.stdout:
+                if "connected" in check.stdout:
                     try:
-                        ready_embed = discord.Embed(title="🟢 VM is Ready!", description=f"**{name}** booted! Use `/vmssh` to connect.", color=0x2ecc71)
-                        ready_embed.add_field(name="🔑 Connect", value=f"`/vmssh` name: `{name}`", inline=False)
+                        ready_embed = discord.Embed(title="🟢 VM is Ready!", description=f"**{name}** fully booted! SSH is available.", color=0x2ecc71)
+                        ready_embed.add_field(name="🔑 Connect", value=f"Use `/vmssh` with name `{name}`", inline=False)
                         await interaction.followup.send(embed=ready_embed, ephemeral=True)
                     except: pass
                     return
-        asyncio.ensure_future(slash_wait_notify())
+        asyncio.ensure_future(slash_notify())
     else:
         embed = discord.Embed(title="❌ Failed", description=f"```{err}```", color=0xe74c3c)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 @tree.command(name="vmstop", description="Stop a running VM")
 @app_commands.describe(name="VM name to stop")
+@app_commands.autocomplete(name=vm_name_autocomplete)
 async def slash_vmstop(interaction: discord.Interaction, name: str):
     if not slash_auth(interaction): await slash_unauth(interaction); return
     await interaction.response.defer(ephemeral=True)
@@ -1374,6 +1301,7 @@ async def slash_vmstop(interaction: discord.Interaction, name: str):
 
 @tree.command(name="vmssh", description="Get SSH link for a VM")
 @app_commands.describe(name="VM name")
+@app_commands.autocomplete(name=vm_name_autocomplete)
 async def slash_vmssh(interaction: discord.Interaction, name: str):
     if not slash_auth(interaction): await slash_unauth(interaction); return
     await interaction.response.defer(ephemeral=True)
@@ -1387,19 +1315,49 @@ async def slash_vmssh(interaction: discord.Interaction, name: str):
     if link:
         embed = discord.Embed(title="🔐 VM SSH Ready", color=0x2ecc71)
         embed.add_field(name="📡 SSH Command", value=f"```{link}```", inline=False)
+        embed.add_field(name="💡 Tip", value="Anti-freeze enabled", inline=False)
     else:
         embed = discord.Embed(title="❌ SSH Failed", description="VM may still be booting. Wait and retry.", color=0xe74c3c)
     await interaction.edit_original_response(embed=embed)
 
+@tree.command(name="vmdelete", description="Delete a VM permanently (double confirmation)")
+@app_commands.describe(name="VM name to delete")
+@app_commands.autocomplete(name=vm_name_autocomplete)
+async def slash_vmdelete(interaction: discord.Interaction, name: str):
+    if not slash_auth(interaction): await slash_unauth(interaction); return
+    await interaction.response.defer(ephemeral=True)
+    if not os_module.path.exists(os_module.path.join(VM_DIR, f"{name}.conf")):
+        await interaction.followup.send(embed=discord.Embed(title="❌ VM Not Found", color=0xe74c3c), ephemeral=True); return
+    user_id = interaction.user.id
+    state = pending_deletes.get(user_id, {})
+    if state.get("vm_name") != name:
+        pending_deletes[user_id] = {"vm_name": name, "step": 1}
+        embed = discord.Embed(title="⚠️ Confirm Delete — Step 1/2", description=f"Delete **{name}**? Run `/vmdelete` again to confirm.", color=0xfee75c)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        async def cancel(uid, vname):
+            await asyncio.sleep(60)
+            if pending_deletes.get(uid,{}).get("vm_name") == vname: pending_deletes.pop(uid,None)
+        asyncio.ensure_future(cancel(user_id, name))
+    elif state.get("step") == 1:
+        pending_deletes[user_id] = {"vm_name": name, "step": 2}
+        embed = discord.Embed(title="🚨 Final Warning — Step 2/2", description=f"**LAST CHANCE.** Run `/vmdelete` one more time to permanently delete **{name}**.", color=0xe74c3c)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    elif state.get("step") == 2:
+        pending_deletes.pop(user_id, None)
+        await interaction.followup.send(embed=discord.Embed(title="🗑️ Deleting...", color=0xe67e22), ephemeral=True)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: delete_vm_files(name))
+        await interaction.edit_original_response(embed=discord.Embed(title="✅ VM Deleted", description=f"**{name}** permanently deleted.", color=0x2ecc71))
+
 @tree.command(name="xrdp", description="Install XRDP and start Pinggy tunnel")
 async def slash_xrdp(interaction: discord.Interaction):
     if not slash_auth(interaction): await slash_unauth(interaction); return
-    await interaction.response.send_message(embed=discord.Embed(title="⏳ Starting XRDP...", color=0x3498db), ephemeral=True)
+    await interaction.response.send_message(embed=discord.Embed(title=f"⏳ Starting XRDP on `{HOST_OS}`...", color=0x3498db), ephemeral=True)
     if not is_xrdp_installed():
-        await interaction.edit_original_response(embed=discord.Embed(title="⏳ Installing XRDP...", description="Takes 2-5 mins...", color=0x3498db))
+        await interaction.edit_original_response(embed=discord.Embed(title="⏳ Installing XRDP...", description=f"Detected `{HOST_OS}`. Takes 2-5 mins...", color=0x3498db))
         loop = asyncio.get_event_loop()
-        ok, _ = await loop.run_in_executor(None, lambda: run_script("DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 firefox-esr xorg && echo OK", timeout=600))
-        if "OK" not in ok:
+        ok, _ = await loop.run_in_executor(None, lambda: run_script(get_xrdp_install_script(), timeout=600))
+        if "XRDP_INSTALL_DONE" not in ok:
             await interaction.edit_original_response(embed=discord.Embed(title="❌ Install Failed", color=0xe74c3c)); return
     if is_pinggy_running(): kill_pinggy(); await asyncio.sleep(2)
     loop = asyncio.get_event_loop()
@@ -1416,7 +1374,7 @@ async def slash_startxrdp(interaction: discord.Interaction):
     if not slash_auth(interaction): await slash_unauth(interaction); return
     await interaction.response.send_message(embed=discord.Embed(title="🔗 Restarting Tunnel...", color=0x3498db), ephemeral=True)
     if is_pinggy_running(): kill_pinggy(); await asyncio.sleep(2)
-    subprocess.run(["bash", "-c", "/etc/init.d/xrdp start 2>/dev/null"], capture_output=True)
+    subprocess.run(["bash","-c","/etc/init.d/xrdp start 2>/dev/null"], capture_output=True)
     loop = asyncio.get_event_loop()
     url = await loop.run_in_executor(None, start_pinggy_and_get_url)
     if url:
@@ -1440,7 +1398,7 @@ async def slash_xrdpfix(interaction: discord.Interaction):
     run_script('echo "xfce4-session" > ~/.xsession; chmod +x ~/.xsession; systemctl restart xrdp 2>/dev/null', timeout=30)
     await interaction.followup.send(embed=discord.Embed(title="✅ XRDP Fixed", description="Run `/startxrdp` for fresh URL.", color=0x2ecc71), ephemeral=True)
 
-@tree.command(name="delxrdp", description="Remove XRDP, XFCE, Firefox completely")
+@tree.command(name="delxrdp", description="Remove XRDP completely")
 async def slash_delxrdp(interaction: discord.Interaction):
     if not slash_auth(interaction): await slash_unauth(interaction); return
     await interaction.response.defer(ephemeral=True)
